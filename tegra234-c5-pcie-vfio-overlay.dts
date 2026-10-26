@@ -1,0 +1,29 @@
+/*
+ * Take the C5 PCIe controller (141a0000.pcie, segment 0005) out of the
+ * SMMU so it no longer shares an IOMMU group with its endpoints. The
+ * group then holds only the root port and the endpoint, which vfio-pci
+ * accepts as viable.
+ *
+ * Overlays cannot delete properties, so "iommus" is overwritten with an
+ * empty value instead: the kernel finds no IOMMU specifier and treats the
+ * controller as having no IOMMU. "iommu-map" is left untouched, so the
+ * endpoints behind this controller stay translated by the SMMU.
+ *
+ * Build: dtc -@ -I dts -O dtb -o tegra234-c5-pcie-vfio-overlay.dtbo tegra234-c5-pcie-vfio-overlay.dts
+ */
+/dts-v1/;
+/plugin/;
+
+/ {
+	overlay-name = "C5 PCIe controller out of IOMMU group (VFIO)";
+	compatible = "nvidia,p3737-0000+p3701-0000", "nvidia,p3737-0000+p3701-0004",
+		     "nvidia,p3737-0000+p3701-0005", "nvidia,p3737-0000+p3701-0008";
+
+	fragment@0 {
+		target-path = "/bus@0/pcie@141a0000";
+
+		__overlay__ {
+			iommus;
+		};
+	};
+};
