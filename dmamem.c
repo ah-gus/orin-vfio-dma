@@ -1,7 +1,8 @@
 /*
  * dmamem.c - devmem-style access to the DMA buffer that vfio_dev shares
  * through a hugetlbfs file (vfio_dev -f FILE). devmem itself cannot reach
- * RAM on this kernel (CONFIG_STRICT_DEVMEM=y).
+ * RAM on this kernel (CONFIG_STRICT_DEVMEM=y). Also works on the BAR link
+ * from vfio_dev -B PATH, as a devmem that takes a path and offset.
  *
  *   dmamem FILE OFFSET [WIDTH [VALUE]]    WIDTH = 8, 16, 32 (default) or 64
  *

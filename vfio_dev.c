@@ -3,7 +3,8 @@
  *
  *   1. enables bus mastering (and memory decoding) in the command register
  *   2. enables MSI and reports interrupts delivered through eventfds
- *   3. mmaps BAR2 (control plane registers) into this process
+ *   3. mmaps a BAR (default BAR2, the control plane registers) into this
+ *      process, and optionally publishes it at a path for other processes
  *   4. allocates a physically contiguous hugetlb DMA buffer and maps it
  *      into the device's IOMMU domain at a fixed IOVA
  *   5. waits for SIGINT/SIGTERM while the device is driven externally
@@ -30,6 +31,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/signalfd.h>
+#include <sys/stat.h>
 #include <sys/vfs.h>
 #include <linux/magic.h>
 #include <linux/mman.h>
@@ -47,11 +49,13 @@
 static struct {
 	const char *bdf;
 	const char *dma_file;	/* NULL = anonymous hugetlb mapping */
+	const char *bar_link;	/* NULL = don't publish the BAR */
 	uint64_t dma_size;
 	uint64_t iova;		/* 0 = choose automatically */
 	unsigned int nvec;
+	int bar;
 	int reset;
-} opt = { .dma_size = SZ_2M, .nvec = 1 };
+} opt = { .dma_size = SZ_2M, .nvec = 1, .bar = 2 };
 
 static int container_fd = -1, group_fd = -1, device_fd = -1;
 static uint64_t cfg_off;	/* offset of the config space region in device_fd */
@@ -77,6 +81,9 @@ static void usage(const char *prog)
 {
 	fprintf(stderr,
 		"usage: %s [options] <BDF>   e.g. %s 0005:01:00.0\n"
+		"  -b BAR    BAR to mmap, 0-5 (default 2)\n"
+		"  -B PATH   publish the BAR at PATH (symlink to its sysfs resource file),\n"
+		"            so other processes can mmap it; removed on exit\n"
 		"  -s SIZE   DMA buffer size (default 2M, up to 1G; K/M/G suffixes)\n"
 		"  -f FILE   back the DMA buffer with FILE on a hugetlbfs mount, so other\n"
 		"            processes can mmap it (page size comes from the mount)\n"
@@ -252,19 +259,18 @@ static void enable_msi(int *efd)
 	if (set_msi(efd, opt.nvec) < 0)
 		die_errno("VFIO_DEVICE_SET_IRQS(MSI)");
 
-	/* report what the device's (virtualized) MSI capability now says */
+	/* VFIO virtualizes the MSI enable bit: it shows what userspace wrote to
+	 * config space, not the SET_IRQS state, so it reads 0 here even though
+	 * MSI is on. "sudo lspci -vv" shows the real "MSI: Enable+". */
 	cap = find_cap(PCI_CAP_ID_MSI);
-	if (cap) {
-		uint16_t ctl = cfg_read16(cap + PCI_MSI_FLAGS);
-		printf("[+] MSI enabled: %u/%u vectors, MSI ctrl=0x%04x (enable=%d, %s-bit)\n",
-		       opt.nvec, ii.count, ctl, !!(ctl & PCI_MSI_FLAGS_ENABLE),
-		       ctl & PCI_MSI_FLAGS_64BIT ? "64" : "32");
-	} else {
-		printf("[+] MSI enabled: %u/%u vectors\n", opt.nvec, ii.count);
-	}
+	printf("[+] MSI enabled: %u/%u vectors", opt.nvec, ii.count);
+	if (cap)
+		printf(", %s-bit address",
+		       cfg_read16(cap + PCI_MSI_FLAGS) & PCI_MSI_FLAGS_64BIT ? "64" : "32");
+	printf("\n");
 }
 
-/* ---- 3. BAR2 ---- */
+/* ---- 3. BAR ---- */
 
 static uint64_t bar_phys(int bar)
 {
@@ -283,25 +289,52 @@ static uint64_t bar_phys(int bar)
 	return start;
 }
 
-static volatile uint32_t *map_bar2(uint64_t *size)
+static volatile uint32_t *map_bar(uint64_t *size)
 {
-	struct vfio_region_info ri = { .argsz = sizeof(ri), .index = VFIO_PCI_BAR2_REGION_INDEX };
+	struct vfio_region_info ri = { .argsz = sizeof(ri),
+				       .index = VFIO_PCI_BAR0_REGION_INDEX + opt.bar };
 	void *p;
 
 	if (ioctl(device_fd, VFIO_DEVICE_GET_REGION_INFO, &ri) < 0)
-		die_errno("get BAR2 region info");
+		die_errno("get BAR region info");
 	if (ri.size == 0)
-		die("BAR2 is not implemented (64-bit BAR0 would occupy BAR0/1; check lspci -vv)");
+		die("BAR%d is not implemented, or is the upper half of a 64-bit BAR (check lspci -vv)",
+		    opt.bar);
 	if (!(ri.flags & VFIO_REGION_INFO_FLAG_MMAP))
-		die("BAR2 is not mmap-able through VFIO (flags=0x%x)", ri.flags);
+		die("BAR%d is not mmap-able through VFIO (flags=0x%x; I/O port BAR?)",
+		    opt.bar, ri.flags);
 
 	p = mmap(NULL, ri.size, PROT_READ | PROT_WRITE, MAP_SHARED, device_fd, ri.offset);
 	if (p == MAP_FAILED)
-		die_errno("mmap BAR2");
+		die_errno("mmap BAR");
 	*size = ri.size;
-	printf("[+] BAR2 mapped: %" PRIu64 " KiB at %p, phys 0x%" PRIx64 " (use this with devmem)\n",
-	       (uint64_t)ri.size >> 10, p, bar_phys(2));
+	printf("[+] BAR%d mapped: %" PRIu64 " KiB at %p, phys 0x%" PRIx64 " (use this with devmem)\n",
+	       opt.bar, (uint64_t)ri.size >> 10, p, bar_phys(opt.bar));
 	return p;
+}
+
+/* MMIO cannot live in a regular file, but the kernel already exposes each
+ * memory BAR as an mmap-able sysfs file. Publish that file at the requested
+ * path so other processes can open() and mmap() the BAR like the DMA file. */
+static void publish_bar(void)
+{
+	char target[PATH_MAX];
+	struct stat st;
+
+	snprintf(target, sizeof(target), "/sys/bus/pci/devices/%s/resource%d", opt.bdf, opt.bar);
+	if (access(target, F_OK) < 0)
+		die("%s: %s", target, strerror(errno));
+	if (lstat(opt.bar_link, &st) == 0) {
+		if (!S_ISLNK(st.st_mode))
+			die("%s exists and is not a symlink; not replacing it", opt.bar_link);
+		unlink(opt.bar_link);
+	}
+	if (symlink(target, opt.bar_link) < 0)
+		die("symlink %s: %s", opt.bar_link, strerror(errno));
+	printf("    shared link (mmap MAP_SHARED)      : %s -> %s\n", opt.bar_link, target);
+	if (access(target, R_OK | W_OK) < 0)
+		printf("[!] %s is root-only; other processes need root, or rerun "
+		       "vfio_setup.sh to give it to your user\n", target);
 }
 
 /* ---- 4. hugetlb DMA buffer ---- */
@@ -534,12 +567,14 @@ static void wait_loop(const int *efd, void *dma)
 int main(int argc, char **argv)
 {
 	int efd[MAX_VECTORS], c;
-	uint64_t bar2_size, hpsz, iova, pa;
-	volatile uint32_t *bar2;
+	uint64_t bar_size, hpsz, iova, pa;
+	volatile uint32_t *bar;
 	void *dma;
 
-	while ((c = getopt(argc, argv, "s:f:i:n:Rh")) != -1) {
+	while ((c = getopt(argc, argv, "b:B:s:f:i:n:Rh")) != -1) {
 		switch (c) {
+		case 'b': opt.bar = strtol(optarg, NULL, 0); break;
+		case 'B': opt.bar_link = optarg; break;
 		case 's': opt.dma_size = parse_size(optarg); break;
 		case 'f': opt.dma_file = optarg; break;
 		case 'i': opt.iova = strtoull(optarg, NULL, 0); break;
@@ -553,12 +588,17 @@ int main(int argc, char **argv)
 	opt.bdf = argv[optind];
 	if (opt.nvec < 1 || opt.nvec > MAX_VECTORS)
 		die("-n must be 1..%d", MAX_VECTORS);
+	if (opt.bar < 0 || opt.bar > 5)
+		die("-b must be 0..5");
 
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	open_vfio();
 
-	bar2 = map_bar2(&bar2_size);
-	printf("    BAR2[0x0] = 0x%08x\n", bar2[0]);
+	/* No register access here: the device is driven externally, and on some
+	 * BARs a read can time out or have side effects. */
+	bar = map_bar(&bar_size);
+	if (opt.bar_link)
+		publish_bar();
 
 	dma = alloc_dma(&hpsz);
 	iova = choose_iova(hpsz);
@@ -589,7 +629,9 @@ int main(int argc, char **argv)
 		close(efd[i]);
 	unmap_dma(iova, hpsz);
 	munmap(dma, hpsz);
-	munmap((void *)bar2, bar2_size);
+	if (opt.bar_link)
+		unlink(opt.bar_link);
+	munmap((void *)bar, bar_size);
 	close(device_fd);
 	close(group_fd);
 	close(container_fd);

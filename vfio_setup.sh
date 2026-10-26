@@ -38,3 +38,9 @@ MNT=/mnt/hugepages-${HP_KB}kB
 mkdir -p "$MNT"
 mountpoint -q "$MNT" || mount -t hugetlbfs -o pagesize=${HP_KB}K,uid=${SUDO_UID:-0},gid=${SUDO_GID:-0},mode=0770 none "$MNT"
 echo "hugetlbfs mount: $MNT   (e.g. vfio_dev -f $MNT/dma0 ...)"
+
+# Let the user who ran sudo mmap the BAR files that vfio_dev -B links to.
+if [ -n "$SUDO_UID" ]; then
+    for r in "$DEV"/resource[0-5]; do [ -e "$r" ] && chown "$SUDO_UID:$SUDO_GID" "$r"; done
+    echo "BAR files owned by uid $SUDO_UID: $(ls "$DEV" | grep -E '^resource[0-5]$' | tr '\n' ' ')"
+fi
